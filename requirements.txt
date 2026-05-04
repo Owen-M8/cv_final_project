@@ -1,0 +1,12 @@
+torch
+torchvision
+numpy
+scipy
+librosa
+matplotlib
+scikit-learn
+opencv-python
+tqdm
+soundfile
+# Install pycochleagram from source:
+#   pip install git+https://github.com/mcdermottLab/pycochleagram.git
