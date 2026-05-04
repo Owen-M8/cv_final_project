@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from config import CLIP_FRAMES, ONSET_FRAME_INDEX, PER_FRAME_FEAT_DIM
 from dataset import ClipIndex, build_clip_index, discover_videos
@@ -51,48 +50,54 @@ def _norm(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 def _gpu_preprocess(
     rgb_frames: np.ndarray,
     device: torch.device,
-    chunk: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """rgb_frames: (N, H, W, 3) uint8. Returns (rgb_normed, spacetime_normed), both (N, 3, 224, 224).
+    """rgb_frames: (N, 224, 224, 3) uint8 — already resized + center-cropped on CPU.
 
-    Resizes one chunk of frames at a time so we never hold the full-resolution
-    float tensor on the GPU (a 73s 1920x1080 clip is ~50 GB at fp32).
-
-    Spacetime image at frame t = stack of gray(t-1), gray(t), gray(t+1)
-    (clamped at boundaries), matching visual_features._grayscale_stack.
+    GPU work here is just float conversion + ImageNet normalize + spacetime stack.
+    Spacetime image at frame t = (gray(t-1), gray(t), gray(t+1)) clamped at edges.
     """
     n = rgb_frames.shape[0]
-    rgb_resized = torch.empty((n, 3, 224, 224), device=device, dtype=torch.float32)
-    for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        x = torch.from_numpy(rgb_frames[s:e]).to(device).permute(0, 3, 1, 2).float() / 255.0
-        x = F.interpolate(x, size=256, mode="bilinear", align_corners=False)
-        h, w = x.shape[-2:]
-        i, j = (h - 224) // 2, (w - 224) // 2
-        rgb_resized[s:e] = x[:, :, i : i + 224, j : j + 224]
+    x = torch.from_numpy(rgb_frames).to(device).permute(0, 3, 1, 2).float() / 255.0  # (N, 3, 224, 224)
 
-    # ITU-R BT.601 luma (cv2.COLOR_RGB2GRAY uses these weights).
-    gray = 0.2989 * rgb_resized[:, 0:1] + 0.5870 * rgb_resized[:, 1:2] + 0.1140 * rgb_resized[:, 2:3]
+    # ITU-R BT.601 luma (cv2.COLOR_RGB2GRAY weights).
+    gray = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
 
     idx_prev = torch.clamp(torch.arange(n, device=device) - 1, min=0)
     idx_next = torch.clamp(torch.arange(n, device=device) + 1, max=n - 1)
-    spacetime = torch.cat([gray[idx_prev], gray, gray[idx_next]], dim=1)  # (n, 3, 224, 224)
+    spacetime = torch.cat([gray[idx_prev], gray, gray[idx_next]], dim=1)  # (N, 3, 224, 224)
 
     mean, std = _norm(device)
-    return (rgb_resized - mean) / std, (spacetime - mean) / std
+    return (x - mean) / std, (spacetime - mean) / std
 
 
-def _read_full_video(path: Path) -> np.ndarray:
-    """Read every frame as RGB uint8 in one pass. Returns (N, H, W, 3)."""
+def _read_full_video(path: Path, out_size: int = 224, resize_short_to: int = 256) -> np.ndarray:
+    """Read every frame as RGB uint8, resized + center-cropped to out_size x out_size.
+
+    Resizing during decode is critical: 1920x1080 video at 30fps over ~70s decodes
+    to ~14 GB of uint8 if we keep original resolution. Resize-then-crop drops it
+    to ~330 MB. Same target geometry as the standard ImageNet pipeline (resize
+    short side to 256, center-crop to 224).
+    """
     cap = cv2.VideoCapture(str(path))
     frames = []
     while True:
         ok, frame = cap.read()
         if not ok:
             break
+        h, w = frame.shape[:2]
+        if h < w:
+            new_h, new_w = resize_short_to, int(round(w * resize_short_to / h))
+        else:
+            new_h, new_w = int(round(h * resize_short_to / w)), resize_short_to
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        ch = (new_h - out_size) // 2
+        cw = (new_w - out_size) // 2
+        frame = frame[ch : ch + out_size, cw : cw + out_size]
         frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     cap.release()
-    return np.stack(frames, axis=0) if frames else np.zeros((0, 1, 1, 3), dtype=np.uint8)
+    if not frames:
+        return np.zeros((0, out_size, out_size, 3), dtype=np.uint8)
+    return np.stack(frames, axis=0)
 
 
 def _features_for_video(
@@ -181,7 +186,56 @@ def _worker(args: tuple[Path, list[ClipIndex]]) -> tuple[str, int, str]:
         return clips[0].entry.video_id if clips else str(video_path), 0, f"{type(e).__name__}: {e}"
 
 
+def main_single(batch_size: int = 128) -> None:
+    """Single-process driver. MPS/CUDA can't share a GPU across processes
+    productively, so we just go single-process and saturate the device."""
+    entries = discover_videos()
+    clips = build_clip_index(entries)
+    print(f"discovered {len(entries)} videos, {len(clips)} valid onsets")
+
+    by_video: dict[str, list[ClipIndex]] = defaultdict(list)
+    for c in clips:
+        by_video[c.entry.video_id].append(c)
+    todo = []
+    for vid, vid_clips in by_video.items():
+        if any(not _feat_cache_path(c).exists() for c in vid_clips):
+            todo.append(vid_clips)
+    print(f"{len(todo)} videos still need feature cache; {len(by_video) - len(todo)} already cached")
+    if not todo:
+        return
+
+    device = _pick_device()
+    print(f"device: {device}")
+    model = _build_resnet18(device)
+    with torch.no_grad():
+        _ = model(torch.zeros(1, 3, 224, 224, device=device))  # warmup
+
+    t0 = time.time()
+    written_total = 0
+    failures: list[tuple[str, str]] = []
+    for done, vid_clips in enumerate(todo, 1):
+        vid = vid_clips[0].entry.video_id
+        try:
+            n_written = _features_for_video(vid_clips, model, device, batch_size=batch_size)
+            written_total += n_written
+        except Exception as e:  # noqa: BLE001
+            failures.append((vid, f"{type(e).__name__}: {e}"))
+        if done % 10 == 0 or done == len(todo):
+            elapsed = time.time() - t0
+            rate = done / max(elapsed, 1e-6)
+            eta = (len(todo) - done) / max(rate, 1e-6)
+            print(
+                f"  {done}/{len(todo)} videos  {written_total} clips cached  "
+                f"elapsed {elapsed/60:.1f}m  eta {eta/60:.1f}m  fails {len(failures)}",
+                flush=True,
+            )
+    print(f"done in {(time.time()-t0)/60:.1f} min; {written_total} clips cached, {len(failures)} failures")
+    for vid, msg in failures[:20]:
+        print(f"  FAIL {vid}: {msg}")
+
+
 def main(n_workers: int) -> None:
+    """Multi-process CPU driver. Use this only when GPU is unavailable."""
     entries = discover_videos()
     clips = build_clip_index(entries)
     print(f"discovered {len(entries)} videos, {len(clips)} valid onsets")
@@ -227,7 +281,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) // 2))
+    parser.add_argument("--workers", type=int, default=1, help="CPU-only multi-process; use 1 to force GPU single-process")
+    parser.add_argument("--batch-size", type=int, default=128)
     args = parser.parse_args()
-    mp.set_start_method("spawn", force=True)
-    main(args.workers)
+    if args.workers <= 1:
+        main_single(batch_size=args.batch_size)
+    else:
+        mp.set_start_method("spawn", force=True)
+        main(args.workers)

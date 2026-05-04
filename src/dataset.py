@@ -36,6 +36,7 @@ from cochleagram import waveform_to_cochleagram
 from onset_detection import detect_onsets, load_times_file
 
 VIDEO_EXTS = (".mp4", ".mov", ".avi", ".mkv")
+CLIP_INDEX_PATH = CACHE_DIR / "clip_index.json"
 
 
 @dataclass
@@ -269,17 +270,92 @@ class GreatestHitsDataset(Dataset):
         return sample
 
 
-def build_datasets() -> tuple[GreatestHitsDataset, GreatestHitsDataset, list[ClipIndex], list[ClipIndex]]:
+def save_clip_index(
+    train_clips: list[ClipIndex],
+    test_clips: list[ClipIndex],
+    path: Path = CLIP_INDEX_PATH,
+) -> None:
+    """Persist the discovered clip index + train/test split to JSON.
+
+    Lets a downstream box (e.g. Colab) reproduce the dataset without seeing the
+    raw video files — paths are stored as strings but never opened during
+    training, since the dataset reads only from cached cochleagrams + features.
+    """
+    import json
+
+    def _ser(c: ClipIndex) -> dict:
+        return {
+            "video_id": c.entry.video_id,
+            "video_path": str(c.entry.video_path),
+            "audio_path": str(c.entry.audio_path),
+            "times_path": str(c.entry.times_path) if c.entry.times_path else None,
+            "onset_time": c.onset_time,
+            "onset_frame": c.onset_frame,
+            "material": c.material,
+            "action": c.action,
+        }
+
+    payload = {
+        "train": [_ser(c) for c in train_clips],
+        "test": [_ser(c) for c in test_clips],
+    }
+    path.write_text(json.dumps(payload))
+    print(f"wrote clip index ({len(train_clips)} train, {len(test_clips)} test) -> {path}")
+
+
+def load_clip_index(path: Path = CLIP_INDEX_PATH) -> tuple[list[ClipIndex], list[ClipIndex]]:
+    import json
+
+    with open(path) as f:
+        payload = json.load(f)
+    _entry_cache: dict[str, VideoEntry] = {}
+
+    def _de_entry(d: dict) -> VideoEntry:
+        if d["video_id"] not in _entry_cache:
+            _entry_cache[d["video_id"]] = VideoEntry(
+                video_path=Path(d["video_path"]),
+                audio_path=Path(d["audio_path"]),
+                times_path=Path(d["times_path"]) if d["times_path"] else None,
+                video_id=d["video_id"],
+            )
+        return _entry_cache[d["video_id"]]
+
+    def _de(d: dict) -> ClipIndex:
+        return ClipIndex(
+            entry=_de_entry(d),
+            onset_time=d["onset_time"],
+            onset_frame=d["onset_frame"],
+            material=d["material"],
+            action=d["action"],
+        )
+
+    return [_de(d) for d in payload["train"]], [_de(d) for d in payload["test"]]
+
+
+def build_datasets(
+    use_cached_index: bool = True,
+) -> tuple[GreatestHitsDataset, GreatestHitsDataset, list[ClipIndex], list[ClipIndex]]:
+    """Build train/test datasets.
+
+    If a serialized clip index exists at CLIP_INDEX_PATH, prefer it (lets us
+    skip video discovery entirely on a box that doesn't have the .mp4 files).
+    Otherwise discover from the local DATA_DIR and persist the index for next time.
+    """
     from config import CLIP_DURATION_S, ENVELOPE_SR
 
-    entries = discover_videos()
-    if not entries:
-        raise FileNotFoundError(
-            f"No (video, audio) pairs found under {DATA_DIR}. "
-            "Drop the Greatest Hits files in there once the download finishes."
-        )
-    clips = build_clip_index(entries)
-    train_clips, test_clips = video_level_split(clips)
+    if use_cached_index and CLIP_INDEX_PATH.exists():
+        train_clips, test_clips = load_clip_index()
+    else:
+        entries = discover_videos()
+        if not entries:
+            raise FileNotFoundError(
+                f"No (video, audio) pairs found under {DATA_DIR}. "
+                "Drop the Greatest Hits files in there once the download finishes."
+            )
+        clips = build_clip_index(entries)
+        train_clips, test_clips = video_level_split(clips)
+        save_clip_index(train_clips, test_clips)
+
     onset_frac = ONSET_FRAME_INDEX / CLIP_FRAMES
     train_ds = GreatestHitsDataset(train_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac)
     test_ds = GreatestHitsDataset(test_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac)
