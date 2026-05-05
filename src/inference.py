@@ -35,7 +35,9 @@ from visual_features import _build_resnet18, extract_clip_features
 
 
 def load_checkpoint(path: Path, device: torch.device) -> tuple[V1MLP, PCAState]:
-    blob = torch.load(path, map_location=device)
+    # weights_only=False: the checkpoint includes a Python dict for the PCA payload,
+    # not just tensors. Safe here because we control what wrote it (train.py).
+    blob = torch.load(path, map_location=device, weights_only=False)
     cfg = blob["config"]
     model = V1MLP(
         n_frames=cfg["n_frames"],
