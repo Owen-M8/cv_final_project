@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 from cache_visual_features import _pick_device
 from config import (
@@ -125,14 +126,18 @@ def _epoch(
     loss_fn: nn.Module,
     device: torch.device,
     opt: torch.optim.Optimizer | None,
+    epoch_num: int,
+    n_epochs: int,
 ) -> float:
     """One training or eval epoch. Pass opt=None for eval."""
     is_train = opt is not None
     model.train(is_train)
     losses = []
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
+    desc = f"ep {epoch_num:02d}/{n_epochs:02d} {'train' if is_train else ' val '}"
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
     with grad_ctx:
-        for batch in loader:
+        for batch in pbar:
             frames = batch["frames"].to(device, non_blocking=True)   # (B, T, 3, H, W)
             flow = batch["flow"].to(device, non_blocking=True)       # (B, T-1, 2, H, W)
             target = batch["target"].to(device, non_blocking=True)
@@ -147,6 +152,9 @@ def _epoch(
                 loss.backward()
                 opt.step()
             losses.append(loss.item())
+            # Running mean of last ~50 batches keeps the postfix readable.
+            recent = losses[-50:]
+            pbar.set_postfix(loss=f"{float(np.mean(recent)):.4f}")
     return float(np.mean(losses)) if losses else float("nan")
 
 
@@ -162,13 +170,13 @@ def main(
     ckpt_name: str | None = None,
 ) -> None:
     device = _pick_device()  # CUDA -> MPS -> CPU
-    print(f"device: {device}")
-    print(f"streams: {streams}  temporal_jitter: ±{temporal_jitter}  color_jitter: {color_jitter}")
+    print(f"device: {device}", flush=True)
+    print(f"streams: {streams}  temporal_jitter: ±{temporal_jitter}  color_jitter: {color_jitter}", flush=True)
 
     train_base, test_base, train_clips, test_clips = build_three_stream_datasets(
         train_temporal_jitter=temporal_jitter,
     )
-    print(f"{len(train_clips)} train clips, {len(test_clips)} test clips")
+    print(f"{len(train_clips)} train clips, {len(test_clips)} test clips", flush=True)
 
     # PCA on training-set cochleagrams (cached as a side effect so the dataset
     # can serve audio targets quickly during training).
@@ -177,7 +185,8 @@ def main(
     print(
         f"PCA fit: kept {PCA_DIM} components, "
         f"explained variance ratio = "
-        f"{(pca.explained_variance / pca.explained_variance.sum()).round(3).tolist()}"
+        f"{(pca.explained_variance / pca.explained_variance.sum()).round(3).tolist()}",
+        flush=True,
     )
 
     train_ds = _TransformedDataset(train_base, pca, augment=True, color_jitter_strength=color_jitter)
@@ -193,13 +202,16 @@ def main(
         num_workers=num_workers, pin_memory=pin, persistent_workers=num_workers > 0,
     )
 
+    print("building frozen backbones (downloads on first run)...", flush=True)
     frozen = FrozenStreams.build(device)
+    print("frozen backbones ready", flush=True)
 
     model_cfg = ModelConfig(streams=tuple(streams))
     head = PCAHead(d_model=TS_D_MODEL, out_dim=PCA_DIM)
     model = ThreeStreamV2A(head, streams=tuple(streams), cfg=model_cfg).to(device)
     print(
-        f"trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}"
+        f"trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}",
+        flush=True,
     )
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -212,10 +224,11 @@ def main(
     history_path = CHECKPOINT_DIR / (ckpt_path.stem + "_history.json")
 
     for epoch in range(1, epochs + 1):
-        tr = _epoch(model, frozen, train_loader, loss_fn, device, opt)
-        va = _epoch(model, frozen, test_loader, loss_fn, device, opt=None)
+        tr = _epoch(model, frozen, train_loader, loss_fn, device, opt, epoch, epochs)
+        va = _epoch(model, frozen, test_loader, loss_fn, device, opt=None,
+                    epoch_num=epoch, n_epochs=epochs)
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
-        print(f"epoch {epoch:02d}  train {tr:.4f}  val {va:.4f}")
+        print(f"epoch {epoch:02d}  train {tr:.4f}  val {va:.4f}", flush=True)
 
         if va < best_val:
             best_val = va
