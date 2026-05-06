@@ -221,6 +221,36 @@ def read_video_clip(video_path: Path, start_frame: int, n_frames: int) -> np.nda
     return np.stack(frames, axis=0)
 
 
+def read_video_clip_at_time(
+    video_path: Path,
+    start_time_s: float,
+    n_frames: int,
+    target_fps: int = VIDEO_FPS,
+) -> np.ndarray:
+    """Read n_frames sampled at target_fps starting at start_time_s.
+
+    Per-frame MSEC seek so the result is independent of the source video's
+    native fps — important when running a 30-fps-trained model on EPIC-KITCHENS
+    video at 50/60 fps. Slower than `read_video_clip` (the seek isn't free)
+    but accurate.
+    """
+    cap = cv2.VideoCapture(str(video_path))
+    frames = []
+    dt_s = 1.0 / target_fps
+    for i in range(n_frames):
+        t_ms = (start_time_s + i * dt_s) * 1000.0
+        cap.set(cv2.CAP_PROP_POS_MSEC, t_ms)
+        ok, frame = cap.read()
+        if not ok:
+            break
+        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if len(frames) < n_frames:
+        last = frames[-1] if frames else np.zeros((1, 1, 3), dtype=np.uint8)
+        frames.extend([last] * (n_frames - len(frames)))
+    return np.stack(frames, axis=0)
+
+
 class GreatestHitsDataset(Dataset):
     """Yields per-clip dicts. Cochleagrams cached per-video on first epoch."""
 
@@ -359,4 +389,155 @@ def build_datasets(
     onset_frac = ONSET_FRAME_INDEX / CLIP_FRAMES
     train_ds = GreatestHitsDataset(train_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac)
     test_ds = GreatestHitsDataset(test_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac)
+    return train_ds, test_ds, train_clips, test_clips
+
+
+# ---------------------------------------------------------------------------
+# Three-stream V2A dataset protocol + Greatest Hits implementation.
+#
+# Defines the interface every V2A dataset must implement so the train/eval
+# loops can be written once and reused across Greatest Hits, EPIC-Sounds, and
+# any future weak-supervision dataset. See `ThreeStreamGHDataset` below for
+# the concrete Greatest Hits implementation.
+# ---------------------------------------------------------------------------
+
+from typing import Protocol
+
+
+class V2AClipDataset(Protocol):
+    """Per-clip dataset for V2A training.
+
+    `__getitem__` returns a dict with keys:
+        frames:      uint8  (CLIP_FRAMES, H, W, 3)        RGB
+        flow:        fp16   (CLIP_FRAMES - 1, 2, H_f, W_f) raw RAFT flow
+        cochleagram: float32 (n_channels, n_audio_steps)   audio target
+        video_id:    str
+        onset_time:  float
+        material:    str (empty if unknown)
+    """
+
+    def __len__(self) -> int: ...
+    def __getitem__(self, idx: int) -> dict: ...
+
+
+class ThreeStreamGHDataset(Dataset):
+    """Greatest Hits dataset for the three-stream model.
+
+    Reads from the three-stream cache (frames + flow). Optionally applies
+    temporal jitter by selecting a random window from the 17-frame cache;
+    the audio target window is shifted by the same offset so audio-visual
+    sync is preserved.
+
+    Yields the V2AClipDataset dict described above.
+    """
+
+    def __init__(
+        self,
+        clips: list[ClipIndex],
+        envelope_sr: int,
+        clip_duration_s: float,
+        onset_frac: float,
+        temporal_jitter: int = 0,
+    ):
+        from config import CACHE_FRAMES_STORED, CLIP_FRAMES as _CF, MAX_TEMPORAL_JITTER
+
+        if temporal_jitter < 0 or temporal_jitter > MAX_TEMPORAL_JITTER:
+            raise ValueError(
+                f"temporal_jitter must be in [0, {MAX_TEMPORAL_JITTER}]; got {temporal_jitter}"
+            )
+        # Window math: cache holds CACHE_FRAMES_STORED frames spanning ±M
+        # around the canonical 15-frame window (M = MAX_TEMPORAL_JITTER).
+        # Default window starts at index M (so cache[M : M+CLIP_FRAMES] is the
+        # canonical 15-frame model input). Jitter offset is added to that.
+        self._cache_frames = CACHE_FRAMES_STORED
+        self._clip_frames = _CF
+        self._max_jitter = MAX_TEMPORAL_JITTER
+        self.clips = clips
+        self.envelope_sr = envelope_sr
+        self.clip_duration_s = clip_duration_s
+        self.onset_frac = onset_frac
+        self.temporal_jitter = temporal_jitter
+        self._coch_cache: dict[str, np.ndarray] = {}
+
+    def __len__(self) -> int:
+        return len(self.clips)
+
+    def _get_full_coch(self, entry: VideoEntry) -> np.ndarray:
+        if entry.video_id not in self._coch_cache:
+            self._coch_cache[entry.video_id] = cochleagram_for_video(entry)
+        return self._coch_cache[entry.video_id]
+
+    def __getitem__(self, idx: int) -> dict:
+        # Imported here to break the streams.py <-> dataset.py cycle at module
+        # load. streams.py only references ClipIndex via TYPE_CHECKING.
+        from streams import load_streams
+
+        clip = self.clips[idx]
+        frames_full, flow_full = load_streams(clip)  # (17, H, W, 3) uint8, (16, 2, H_f, W_f) fp16
+
+        if self.temporal_jitter > 0:
+            off = int(np.random.randint(-self.temporal_jitter, self.temporal_jitter + 1))
+        else:
+            off = 0
+        start = self._max_jitter + off  # canonical center is at index _max_jitter
+
+        frames = frames_full[start : start + self._clip_frames]                    # (T, H, W, 3)
+        # Flow at index i is motion frame_i -> frame_{i+1}. For a frame window
+        # [start .. start+T), aligned flow is [start .. start+T-1) -> (T-1) fields.
+        flow = flow_full[start : start + self._clip_frames - 1]                    # (T-1, 2, H_f, W_f)
+
+        # Audio window shifts with the visual window so the impact stays
+        # synchronized; the impact's *position within the window* changes by
+        # `off` frames, which trains the model to be robust to small onset
+        # localization errors (the realistic case for cross-dataset transfer).
+        full_coch = self._get_full_coch(clip.entry)
+        shifted_onset_frac = (ONSET_FRAME_INDEX - off) / self._clip_frames
+        coch = slice_cochleagram_for_clip(
+            full_coch,
+            clip.onset_time,
+            self.envelope_sr,
+            self.clip_duration_s,
+            shifted_onset_frac,
+        )
+
+        return {
+            "frames": frames,
+            "flow": flow,
+            "cochleagram": coch.astype(np.float32),
+            "video_id": clip.entry.video_id,
+            "onset_time": clip.onset_time,
+            "material": clip.material or "",
+        }
+
+
+def build_three_stream_datasets(
+    use_cached_index: bool = True,
+    train_temporal_jitter: int = 1,
+) -> tuple[ThreeStreamGHDataset, ThreeStreamGHDataset, list[ClipIndex], list[ClipIndex]]:
+    """Three-stream sibling of `build_datasets`. Train set has temporal jitter
+    enabled by default; test set has it off for deterministic eval."""
+    from config import CLIP_DURATION_S, ENVELOPE_SR
+
+    if use_cached_index and CLIP_INDEX_PATH.exists():
+        train_clips, test_clips = load_clip_index()
+    else:
+        entries = discover_videos()
+        if not entries:
+            raise FileNotFoundError(
+                f"No (video, audio) pairs found under {DATA_DIR}. "
+                "Drop the Greatest Hits files in there once the download finishes."
+            )
+        clips = build_clip_index(entries)
+        train_clips, test_clips = video_level_split(clips)
+        save_clip_index(train_clips, test_clips)
+
+    onset_frac = ONSET_FRAME_INDEX / CLIP_FRAMES
+    train_ds = ThreeStreamGHDataset(
+        train_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac,
+        temporal_jitter=train_temporal_jitter,
+    )
+    test_ds = ThreeStreamGHDataset(
+        test_clips, ENVELOPE_SR, CLIP_DURATION_S, onset_frac,
+        temporal_jitter=0,
+    )
     return train_ds, test_ds, train_clips, test_clips
