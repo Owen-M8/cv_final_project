@@ -128,31 +128,47 @@ def _epoch(
     opt: torch.optim.Optimizer | None,
     epoch_num: int,
     n_epochs: int,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> float:
-    """One training or eval epoch. Pass opt=None for eval."""
+    """One training or eval epoch. Pass opt=None for eval.
+
+    Mixed precision: when device is CUDA, frozen forward + trainable forward run
+    inside torch.amp.autocast('cuda'). On train, gradients are scaled via
+    `scaler` to avoid fp16 underflow (caller passes one in). On eval, autocast
+    alone is enough — no scaler needed without a backward pass.
+    """
     is_train = opt is not None
     model.train(is_train)
     losses = []
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
+    use_amp = device.type == "cuda"
+    autocast_ctx = (
+        torch.amp.autocast("cuda") if use_amp else torch.amp.autocast("cpu", enabled=False)
+    )
     desc = f"ep {epoch_num:02d}/{n_epochs:02d} {'train' if is_train else ' val '}"
     pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
     with grad_ctx:
         for batch in pbar:
-            frames = batch["frames"].to(device, non_blocking=True)   # (B, T, 3, H, W)
-            flow = batch["flow"].to(device, non_blocking=True)       # (B, T-1, 2, H, W)
+            frames = batch["frames"].to(device, non_blocking=True)
+            flow = batch["flow"].to(device, non_blocking=True)
             target = batch["target"].to(device, non_blocking=True)
 
-            with torch.no_grad():
-                app, m3d = compute_frozen_features(frames, frozen)
+            with autocast_ctx:
+                with torch.no_grad():
+                    app, m3d = compute_frozen_features(frames, frozen)
+                pred = model(appearance=app, motion3d=m3d, flow_field=flow)
+                loss = loss_fn(pred, target)
 
-            pred = model(appearance=app, motion3d=m3d, flow_field=flow)
-            loss = loss_fn(pred, target)
             if is_train:
                 opt.zero_grad()
-                loss.backward()
-                opt.step()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.step(opt)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    opt.step()
             losses.append(loss.item())
-            # Running mean of last ~50 batches keeps the postfix readable.
             recent = losses[-50:]
             pbar.set_postfix(loss=f"{float(np.mean(recent)):.4f}")
     return float(np.mean(losses)) if losses else float("nan")
@@ -168,6 +184,7 @@ def main(
     num_workers: int = 2,
     weight_decay: float = 1e-4,
     ckpt_name: str | None = None,
+    eval_every: int = 1,
 ) -> None:
     device = _pick_device()  # CUDA -> MPS -> CPU
     print(f"device: {device}", flush=True)
@@ -216,6 +233,10 @@ def main(
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.MSELoss()
+    # GradScaler is only meaningful on CUDA; on MPS/CPU we run plain training.
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+    print(f"AMP: {'on (cuda autocast + GradScaler)' if scaler else 'off (non-CUDA device)'}", flush=True)
+    print(f"eval cadence: every {eval_every} epoch(s)", flush=True)
 
     history = []
     best_val = float("inf")
@@ -224,13 +245,25 @@ def main(
     history_path = CHECKPOINT_DIR / (ckpt_path.stem + "_history.json")
 
     for epoch in range(1, epochs + 1):
-        tr = _epoch(model, frozen, train_loader, loss_fn, device, opt, epoch, epochs)
-        va = _epoch(model, frozen, test_loader, loss_fn, device, opt=None,
-                    epoch_num=epoch, n_epochs=epochs)
-        history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
-        print(f"epoch {epoch:02d}  train {tr:.4f}  val {va:.4f}", flush=True)
+        tr = _epoch(model, frozen, train_loader, loss_fn, device, opt,
+                    epoch, epochs, scaler=scaler)
 
-        if va < best_val:
+        # Skip eval on intermediate epochs unless it's an eval epoch or the
+        # final epoch — saves ~25% of wall time per epoch with minimal loss
+        # of resolution on the val curve.
+        do_eval = (epoch % eval_every == 0) or (epoch == epochs)
+        if do_eval:
+            va = _epoch(model, frozen, test_loader, loss_fn, device, opt=None,
+                        epoch_num=epoch, n_epochs=epochs)
+        else:
+            va = float("nan")
+        history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
+        if do_eval:
+            print(f"epoch {epoch:02d}  train {tr:.4f}  val {va:.4f}", flush=True)
+        else:
+            print(f"epoch {epoch:02d}  train {tr:.4f}  val   - (skipped)", flush=True)
+
+        if do_eval and va < best_val:
             best_val = va
             torch.save(
                 {
@@ -249,6 +282,7 @@ def main(
                         "weight_decay": weight_decay,
                         "temporal_jitter": temporal_jitter,
                         "color_jitter": color_jitter,
+                        "eval_every": eval_every,
                     },
                 },
                 ckpt_path,
@@ -256,8 +290,8 @@ def main(
 
     with open(history_path, "w") as f:
         json.dump(history, f, indent=2)
-    print(f"saved checkpoint -> {ckpt_path}")
-    print(f"saved history    -> {history_path}")
+    print(f"saved checkpoint -> {ckpt_path}", flush=True)
+    print(f"saved history    -> {history_path}", flush=True)
 
 
 if __name__ == "__main__":
@@ -275,6 +309,11 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--ckpt-name", type=str, default=None)
+    parser.add_argument(
+        "--eval-every", type=int, default=1,
+        help="Run val pass every N epochs (default 1 = every epoch). "
+        "Final epoch is always evaluated.",
+    )
     args = parser.parse_args()
     main(
         epochs=args.epochs,
@@ -286,4 +325,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         weight_decay=args.weight_decay,
         ckpt_name=args.ckpt_name,
+        eval_every=args.eval_every,
     )
