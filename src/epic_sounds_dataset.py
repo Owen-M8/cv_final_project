@@ -5,14 +5,20 @@ video clips from EPIC-KITCHENS-100. Conforms to the V2AClipDataset protocol so
 the same eval loop works on Greatest Hits and EPIC-Sounds.
 
 Data the user must supply (this module does *not* download them):
-  1. EPIC-Sounds annotations CSV (a few hundred KB)
-       https://github.com/epic-kitchens/EPIC-SOUNDS-annotations
+  1. EPIC-Sounds annotations CSV (~800 KB for validation; ~6 MB for train)
+       https://github.com/epic-kitchens/epic-sounds-annotations
+       Files: EPIC_Sounds_{train,validation}.csv
   2. EPIC-KITCHENS-100 video files
        https://epic-kitchens.github.io/2024
        Layout assumed:
          <videos_dir>/<participant_id>/videos/<video_id>.MP4
        or fallback:
          <videos_dir>/<video_id>.MP4
+
+Real CSV columns (verified against the validation file):
+  annotation_id, participant_id, video_id, start_timestamp, stop_timestamp,
+  start_sample, stop_sample, description, class, class_id
+Timestamps are HH:MM:SS.ms strings; samples are audio sample indices (24 kHz).
 
 Cache layout (under cache/epic_sounds/):
   <video_id>_t<onset>_clip.npz    JPEG-encoded 17 frames at 224x224
@@ -105,6 +111,12 @@ def _read_annotations(
     return rows
 
 
+def _timestamp_to_seconds(ts: str) -> float:
+    """EPIC-Sounds timestamps look like 'HH:MM:SS.ms'. Returns seconds (float)."""
+    h, m, rest = ts.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest)
+
+
 def discover_epic_clips(
     annotations_csv: Path,
     videos_dir: Path,
@@ -119,14 +131,16 @@ def discover_epic_clips(
     rows = _read_annotations(annotations_csv, classes)
     clips: list[EpicClip] = []
     missing_videos: set[str] = set()
+    parse_failed = 0
     for row in rows:
-        vid = row.get("video_id") or row.get("Video_ID") or row.get("video")
+        vid = row.get("video_id")
         if not vid:
             continue
         try:
-            t_start = float(row.get("start_seconds", 0.0))
-            t_end = float(row.get("stop_seconds", t_start + 0.5))
-        except ValueError:
+            t_start = _timestamp_to_seconds(row["start_timestamp"])
+            t_end = _timestamp_to_seconds(row["stop_timestamp"])
+        except (KeyError, ValueError):
+            parse_failed += 1
             continue
         path = _resolve_video_path(vid, videos_dir)
         if path is None:
@@ -150,6 +164,8 @@ def discover_epic_clips(
         )
     if missing_videos:
         print(f"[epic-sounds] skipped {len(missing_videos)} clips with missing videos")
+    if parse_failed:
+        print(f"[epic-sounds] skipped {parse_failed} rows with unparseable timestamps")
     return clips
 
 
