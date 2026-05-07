@@ -77,9 +77,14 @@ class EpicClip:
 # ---------------------------------------------------------------------------
 
 def _resolve_video_path(video_id: str, videos_dir: Path) -> Optional[Path]:
-    """Try the common EPIC-KITCHENS layouts in order."""
+    """Try the common EPIC-KITCHENS layouts in order.
+
+    The official epic_downloader.py nests files under an extra
+    `EPIC-KITCHENS/` directory; we check that first.
+    """
     participant = video_id.split("_")[0]  # "P01_01" -> "P01"
     candidates = [
+        videos_dir / "EPIC-KITCHENS" / participant / "videos" / f"{video_id}.MP4",
         videos_dir / participant / "videos" / f"{video_id}.MP4",
         videos_dir / participant / f"{video_id}.MP4",
         videos_dir / f"{video_id}.MP4",

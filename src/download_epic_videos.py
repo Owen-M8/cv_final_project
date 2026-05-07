@@ -30,14 +30,23 @@ MIN_VIDEO_SIZE_BYTES = 50_000_000  # 50 MB sanity floor — real EPIC videos are
 
 
 def _expected_path(output_path: Path, video_id: str) -> Path:
-    """Where the official downloader places <video_id>.MP4 once it finishes."""
+    """Where the official downloader places <video_id>.MP4 once it finishes.
+
+    The downloader nests files under an extra `EPIC-KITCHENS/` directory.
+    """
     participant = video_id.split("_")[0]  # "P01_11" -> "P01"
-    return output_path / participant / "videos" / f"{video_id}.MP4"
+    return output_path / "EPIC-KITCHENS" / participant / "videos" / f"{video_id}.MP4"
 
 
 def _is_already_downloaded(output_path: Path, video_id: str) -> bool:
     p = _expected_path(output_path, video_id)
-    return p.exists() and p.stat().st_size >= MIN_VIDEO_SIZE_BYTES
+    if p.exists() and p.stat().st_size >= MIN_VIDEO_SIZE_BYTES:
+        return True
+    # Older runs (before the EPIC-KITCHENS nesting was understood) wrote to
+    # output_path / <P> / videos / <vid>.MP4. Treat those as cached too.
+    participant = video_id.split("_")[0]
+    legacy = output_path / participant / "videos" / f"{video_id}.MP4"
+    return legacy.exists() and legacy.stat().st_size >= MIN_VIDEO_SIZE_BYTES
 
 
 def _download_one(downloader: Path, output_path: Path, video_id: str) -> int:
