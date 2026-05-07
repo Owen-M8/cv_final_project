@@ -41,15 +41,21 @@ def _is_already_downloaded(output_path: Path, video_id: str) -> bool:
 
 
 def _download_one(downloader: Path, output_path: Path, video_id: str) -> int:
-    """Returns the subprocess exit code from the official downloader."""
+    """Returns the subprocess exit code from the official downloader.
+
+    Runs the downloader with cwd=<downloader's directory>. The official script
+    references its own `data/epic_55_splits.csv` via a relative path, so it
+    can only resolve those files when invoked from its own directory. We pass
+    --output-path as an absolute path so writes still land in our project.
+    """
     cmd = [
         sys.executable, str(downloader),
         "--videos",
         "--specific-videos", video_id,
-        "--output-path", str(output_path),
+        "--output-path", str(output_path.resolve()),
     ]
-    print(f"  $ {' '.join(cmd)}", flush=True)
-    return subprocess.run(cmd).returncode
+    print(f"  $ (cwd={downloader.parent}) {' '.join(cmd)}", flush=True)
+    return subprocess.run(cmd, cwd=str(downloader.parent)).returncode
 
 
 def main() -> None:
@@ -80,6 +86,7 @@ def main() -> None:
         sys.exit(f"video-ids file not found: {args.video_ids}")
 
     args.output_path.mkdir(parents=True, exist_ok=True)
+    args.output_path = args.output_path.resolve()  # absolute, so cwd changes inside _download_one don't break it
     video_ids = [
         line.strip()
         for line in args.video_ids.read_text().splitlines()
