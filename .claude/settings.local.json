@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(rm -f cache/2015-02-16-16-49-06_f*_feat.npy)",
-      "Bash(python3 -c ' *)"
-    ]
-  }
-}
